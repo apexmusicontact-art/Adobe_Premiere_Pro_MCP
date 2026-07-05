@@ -3428,8 +3428,9 @@ export class PremiereProTools {
       const linearValue = Math.pow(10, (kf.level - DB_CALIBRATION_OFFSET) / 20);
       return `
         try {
-          levelProp.addKey(${kf.time});
-          levelProp.setValueAtKey(${kf.time}, ${linearValue}, true);
+          var __kfTicks = __secondsToTicks(clip.inPoint.seconds + ${kf.time});
+          levelProp.addKey(__kfTicks);
+          levelProp.setValueAtKey(__kfTicks, ${linearValue}, true);
           addedKeyframes.push({ time: ${kf.time}, level: ${kf.level}, linearValue: ${linearValue} });
         } catch (e2) {
           failedKeyframes.push({ time: ${kf.time}, level: ${kf.level}, error: e2.toString() });
@@ -4900,8 +4901,9 @@ export class PremiereProTools {
         }
         if (!param) return JSON.stringify({ success: false, error: "Parameter " + ${JSON.stringify(paramName)} + " not found in component " + ${JSON.stringify(componentName)} });
         param.setTimeVarying(true);
-        param.addKey(${time});
-        param.setValueAtKey(${time}, ${value}, true);
+        var __kfTicks = __secondsToTicks(clip.inPoint.seconds + ${time});
+        param.addKey(__kfTicks);
+        param.setValueAtKey(__kfTicks, ${value}, true);
         return JSON.stringify({
           success: true,
           message: "Keyframe added",
@@ -4937,7 +4939,7 @@ export class PremiereProTools {
           }
         }
         if (!param) return JSON.stringify({ success: false, error: "Parameter not found" });
-        param.removeKey(${time});
+        param.removeKey(__secondsToTicks(clip.inPoint.seconds + ${time}));
         return JSON.stringify({
           success: true,
           message: "Keyframe removed",
@@ -4981,10 +4983,13 @@ export class PremiereProTools {
         }
         var keys = param.getKeys();
         var result = [];
+        var __clipInPointSeconds = clip.inPoint.seconds;
         for (var k = 0; k < keys.length; k++) {
+          var keyTime = keys[k];
+          var keySeconds = (keyTime && typeof keyTime.seconds !== "undefined") ? keyTime.seconds : __ticksToSeconds(keyTime);
           result.push({
-            time: keys[k],
-            value: param.getValueAtKey(keys[k])
+            time: keySeconds - __clipInPointSeconds,
+            value: param.getValueAtKey(keyTime)
           });
         }
         return JSON.stringify({

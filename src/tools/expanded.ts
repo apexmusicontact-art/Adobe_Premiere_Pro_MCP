@@ -178,13 +178,27 @@ export const expandedToolNames = [
   'consolidate_and_transfer'
 ] as const;
 
+// z.record(z.any()) converts to a JSON Schema with no declared properties, which causes
+// MCP clients to strip arguments before they reach executeExpandedTool. Tools whose handler
+// actually reads named args need an explicit schema here so those args survive validation.
+const EXPANDED_TOOL_SCHEMA_OVERRIDES: Partial<Record<string, z.ZodSchema<any>>> = {
+  execute_extendscript: z.object({
+    script: z.string().optional().describe('ExtendScript source to execute'),
+    code: z.string().optional().describe('Alias for script')
+  }),
+  evaluate_expression: z.object({
+    expression: z.string().optional().describe('JS expression to evaluate in the ExtendScript context'),
+    code: z.string().optional().describe('Alias for expression')
+  })
+};
+
 export function getExpandedTools(existingNames: Set<string>): MCPTool[] {
   return expandedToolNames
     .filter((name) => !existingNames.has(name))
     .map((name) => ({
       name,
       description: `Premiere Pro expanded operation: ${name.replace(/_/g, ' ')}.`,
-      inputSchema: z.record(z.any())
+      inputSchema: EXPANDED_TOOL_SCHEMA_OVERRIDES[name] ?? z.record(z.any())
     }));
 }
 
