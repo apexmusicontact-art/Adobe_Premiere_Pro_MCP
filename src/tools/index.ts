@@ -311,6 +311,20 @@ export class PremiereProTools {
         })
       },
       {
+        name: 'place_background_blocks',
+        description: 'Bulk: places a still/background media item on a video track across multiple time blocks in a single ExtendScript call, each trimmed to an exact [startTime, endTime) duration (via back-to-back placement + QE razor trim, since direct clip.duration assignment does not work) and scaled via Motion/Scale. Never touches audio tracks. Re-reads actual placement/scale from the live DOM before reporting success. Returns per-block results.',
+        inputSchema: z.object({
+          projectItemId: z.string().describe('The ID of the project item (e.g. background image) to place'),
+          sequenceId: z.string().describe('The ID of the target sequence'),
+          trackIndex: z.number().describe('The video track index (0-based) to place blocks on'),
+          blocks: z.array(z.object({
+            startTime: z.number().describe('Absolute timeline start time in seconds'),
+            endTime: z.number().describe('Absolute timeline end time in seconds (exclusive)'),
+            scale: z.number().describe('Motion > Scale value to apply to the placed clip(s) covering this block')
+          })).describe('Array of blocks to place, one entry per background segment')
+        })
+      },
+      {
         name: 'remove_from_timeline',
         description: 'Removes a clip from the timeline. Pass sequenceId when the clip ID came from list_sequence_tracks for a non-active sequence.',
         inputSchema: z.object({
@@ -832,6 +846,19 @@ export class PremiereProTools {
           paramName: z.string().describe('The display name of the parameter')
         })
       },
+      {
+        name: 'batch_add_keyframes',
+        description: 'Bulk: adds multiple keyframes (potentially across different clips/components/params) in a single ExtendScript call. Returns per-keyframe results. Saves N MCP roundtrips when animating many clips (e.g. zoom sequences).',
+        inputSchema: z.object({
+          keyframes: z.array(z.object({
+            clipId: z.string().describe('The ID of the clip'),
+            componentName: z.string().describe('The display name of the component (e.g., "Motion", "Opacity")'),
+            paramName: z.string().describe('The display name of the parameter (e.g., "Position", "Scale")'),
+            time: z.number().describe('The time in seconds for the keyframe, relative to the start of the clip'),
+            value: z.number().describe('The value to set at this keyframe')
+          })).describe('Array of keyframes to add, one entry per keyframe')
+        })
+      },
 
       // Work Area
       {
@@ -1230,6 +1257,8 @@ export class PremiereProTools {
         // Timeline Operations
         case 'add_to_timeline':
           return await this.addToTimeline(args.sequenceId, args.projectItemId, args.trackIndex, args.time, args.insertMode, args.linkAudio);
+        case 'place_background_blocks':
+          return await this.placeBackgroundBlocks(args.projectItemId, args.sequenceId, args.trackIndex, args.blocks);
         case 'remove_from_timeline':
           return await this.removeFromTimeline(args.clipId, args.sequenceId, args.deleteMode);
         case 'move_clip':
@@ -1383,6 +1412,8 @@ export class PremiereProTools {
           return await this.removeKeyframe(args.clipId, args.componentName, args.paramName, args.time);
         case 'get_keyframes':
           return await this.getKeyframes(args.clipId, args.componentName, args.paramName);
+        case 'batch_add_keyframes':
+          return await this.batchAddKeyframes(args.keyframes);
 
         // Work Area
         case 'set_work_area':
@@ -2620,6 +2651,202 @@ export class PremiereProTools {
     }
   }
 
+  // Places a still/background media item across multiple timeline blocks in one ExtendScript
+  // pass. Direct assignment to clip.inPoint/outPoint/duration on a placed TrackItem is a
+  // silent no-op in this Premiere version (confirmed: trim_clip returns success without
+  // changing anything), so exact-duration placement is done the same way an editor does it
+  // by hand: place the source back-to-back until the block is covered, QE-razor the last
+  // copy at the exact end time, then remove the trailing fragment. The razor is scoped to
+  // exactly one video track (qeVideoTrack for trackIndex) and never touches qe audio tracks.
+  private async placeBackgroundBlocks(
+    projectItemId: string,
+    sequenceId: string,
+    trackIndex: number,
+    blocks: Array<{ startTime: number; endTime: number; scale: number }>
+  ): Promise<any> {
+    const blocksJson = JSON.stringify(blocks || []);
+    const script = `
+      try {
+        app.enableQE();
+        var seq = __findSequence(${JSON.stringify(sequenceId)});
+        if (!seq) return JSON.stringify({ success: false, error: "Sequence not found" });
+        var projectItem = __findProjectItem(${JSON.stringify(projectItemId)});
+        if (!projectItem) return JSON.stringify({ success: false, error: "Project item not found" });
+
+        app.project.activeSequence = seq;
+        var qeSeq = qe.project.getActiveSequence();
+        if (!qeSeq) return JSON.stringify({ success: false, error: "QE active sequence unavailable" });
+
+        var track = seq.videoTracks[${trackIndex}];
+        if (!track) return JSON.stringify({ success: false, error: "Video track not found at index ${trackIndex}", videoTrackCount: seq.videoTracks.numTracks });
+        var qeVideoTrack = qeSeq.getVideoTrackAt(${trackIndex});
+        if (!qeVideoTrack) return JSON.stringify({ success: false, error: "QE video track not found at index ${trackIndex}" });
+
+        var fps = seq.timebase ? (254016000000 / parseInt(seq.timebase, 10)) : 30;
+        var TIME_EPS = (1 / fps) + 0.0005;
+        var SCALE_EPS = 0.01;
+
+        function frameToTimecode(totalFrames) {
+          var hours = Math.floor(totalFrames / (fps * 3600));
+          var mins = Math.floor((totalFrames % (fps * 3600)) / (fps * 60));
+          var secs = Math.floor((totalFrames % (fps * 60)) / fps);
+          var frames = Math.round(totalFrames % fps);
+          function pad(n) { return n < 10 ? "0" + n : "" + n; }
+          return pad(hours) + ":" + pad(mins) + ":" + pad(secs) + ":" + pad(frames);
+        }
+
+        // qeTrack.razor(tc) keeps the targeted frame in the FIRST segment and cuts the
+        // boundary after it (confirmed empirically: razoring at frame F produces a boundary
+        // at frame F+1, not F). To land the boundary exactly at seconds->frame F, we must
+        // target frame F-1.
+        function toCutTimecode(seconds) {
+          var targetFrame = Math.round(seconds * fps);
+          var cutFrame = targetFrame - 1;
+          if (cutFrame < 0) cutFrame = 0;
+          return frameToTimecode(cutFrame);
+        }
+
+        function findClipAtStart(trk, atSeconds) {
+          var best = null, bestDiff = 999999;
+          for (var ci = 0; ci < trk.clips.numItems; ci++) {
+            var c = trk.clips[ci];
+            var diff = Math.abs(c.start.seconds - atSeconds);
+            if (diff < bestDiff) { bestDiff = diff; best = c; }
+          }
+          return (best && bestDiff < TIME_EPS) ? best : null;
+        }
+
+        function getMotionScaleProp(clip) {
+          var comp = null;
+          for (var ci = 0; ci < clip.components.numItems; ci++) {
+            if (clip.components[ci].displayName === "Motion") { comp = clip.components[ci]; break; }
+          }
+          if (!comp) return null;
+          for (var pj = 0; pj < comp.properties.numItems; pj++) {
+            if (comp.properties[pj].displayName === "Scale") return comp.properties[pj];
+          }
+          return null;
+        }
+
+        var blocksInput = ${blocksJson};
+        var results = [];
+
+        for (var b = 0; b < blocksInput.length; b++) {
+          var block = blocksInput[b];
+          try {
+            var startTime = block.startTime;
+            var endTime = block.endTime;
+            var scale = block.scale;
+            if (typeof startTime !== "number" || typeof endTime !== "number" || endTime <= startTime) {
+              results.push({ blockIndex: b, success: false, clipIds: [], error: "Invalid startTime/endTime" });
+              continue;
+            }
+
+            // Place copies of the source back-to-back until the block duration is covered,
+            // using each clip's actual (frame-quantized) end as the next insertion point to
+            // avoid float drift.
+            var placed = [];
+            var cursor = startTime;
+            var guard = 0;
+            while (cursor < endTime - TIME_EPS && guard < 500) {
+              guard++;
+              track.overwriteClip(projectItem, cursor);
+              var newClip = findClipAtStart(track, cursor);
+              if (!newClip) throw new Error("Placement did not produce a track item at " + cursor);
+              placed.push(newClip);
+              var newEnd = newClip.end.seconds;
+              if (newEnd <= cursor + 0.0001) throw new Error("Placed clip has non-positive duration");
+              cursor = newEnd;
+            }
+            if (guard >= 500) throw new Error("Exceeded max copies while filling block duration (possible zero-length source)");
+
+            // Trim the trailing excess of the last placed clip down to endTime, if any,
+            // via QE razor scoped to this one video track only (never audio).
+            if (cursor > endTime + TIME_EPS) {
+              var lastClip = placed[placed.length - 1];
+              var lastStart = lastClip.start.seconds;
+              var tc = toCutTimecode(endTime);
+              qeVideoTrack.razor(tc);
+              var retained = null, leftover = null;
+              for (var ri = 0; ri < track.clips.numItems; ri++) {
+                var rc = track.clips[ri];
+                if (Math.abs(rc.start.seconds - lastStart) < TIME_EPS) retained = rc;
+                else if (Math.abs(rc.start.seconds - endTime) < TIME_EPS) leftover = rc;
+              }
+              if (leftover) leftover.remove(false, false);
+              if (retained) placed[placed.length - 1] = retained;
+            }
+
+            var clipIds = [];
+            var scaleFails = [];
+            for (var pi = 0; pi < placed.length; pi++) {
+              var pClip = placed[pi];
+              clipIds.push(String(pClip.nodeId));
+              var scaleProp = getMotionScaleProp(pClip);
+              if (!scaleProp) { scaleFails.push(pClip.nodeId + ": Motion/Scale not found"); continue; }
+              scaleProp.setValue(scale, true);
+            }
+
+            // Verification pass: re-read actual placement/scale from the live DOM rather
+            // than trusting that the calls above didn't throw.
+            var actualStart = null, actualEnd = null, actualScale = null, scaleMismatch = false;
+            for (var vi = 0; vi < placed.length; vi++) {
+              var vClip = placed[vi];
+              var vStart = vClip.start.seconds;
+              var vEnd = vClip.end.seconds;
+              if (actualStart === null || vStart < actualStart) actualStart = vStart;
+              if (actualEnd === null || vEnd > actualEnd) actualEnd = vEnd;
+              var vScaleProp = getMotionScaleProp(vClip);
+              var vScale = vScaleProp ? vScaleProp.getValue() : null;
+              if (actualScale === null) actualScale = vScale;
+              if (vScale === null || Math.abs(vScale - scale) > SCALE_EPS) scaleMismatch = true;
+            }
+
+            var timeMismatch = (actualStart === null || Math.abs(actualStart - startTime) > TIME_EPS ||
+                                 actualEnd === null || Math.abs(actualEnd - endTime) > TIME_EPS);
+
+            if (scaleFails.length > 0 || scaleMismatch || timeMismatch) {
+              var errParts = [];
+              if (scaleFails.length) errParts.push(scaleFails.join("; "));
+              if (timeMismatch) errParts.push("Time mismatch: requested [" + startTime + "," + endTime + "] actual [" + actualStart + "," + actualEnd + "]");
+              if (scaleMismatch) errParts.push("Scale mismatch: requested " + scale + " actual " + actualScale);
+              results.push({
+                blockIndex: b,
+                success: false,
+                clipIds: clipIds,
+                actualStartTime: actualStart,
+                actualEndTime: actualEnd,
+                actualScale: actualScale,
+                error: errParts.join(" | ")
+              });
+            } else {
+              results.push({
+                blockIndex: b,
+                success: true,
+                clipIds: clipIds,
+                actualStartTime: actualStart,
+                actualEndTime: actualEnd,
+                actualScale: actualScale
+              });
+            }
+          } catch (eBlock) {
+            results.push({ blockIndex: b, success: false, clipIds: [], error: eBlock.toString() });
+          }
+        }
+
+        return JSON.stringify({
+          success: true,
+          totalProcessed: results.length,
+          allOk: results.every ? results.every(function(r){ return r.success; }) : true,
+          results: results
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: "QE DOM error: " + e.toString() });
+      }
+    `;
+    return await this.bridge.executeScript(script);
+  }
+
   private async removeFromTimeline(clipId: string, sequenceId?: string, deleteMode = 'ripple'): Promise<any> {
     const script = `
       try {
@@ -2741,8 +2968,11 @@ export class PremiereProTools {
 
   private async razorTimelineAtTime(sequenceId?: string, time?: number, videoTrackIndices?: number[], audioTrackIndices?: number[]): Promise<any> {
     const normalizedTime = time ?? 0;
-    const videoIndices = videoTrackIndices ?? [];
-    const audioIndices = audioTrackIndices ?? [];
+    // Preserve the distinction between "not provided" (default: all tracks) and "explicitly
+    // empty array" (no tracks of that kind). Collapsing both to [] made an empty
+    // audioTrackIndices behave like "cut all audio tracks" instead of "cut none".
+    const videoIndices = videoTrackIndices === undefined ? null : videoTrackIndices;
+    const audioIndices = audioTrackIndices === undefined ? null : audioTrackIndices;
 
     const script = `
       try {
@@ -2772,7 +3002,7 @@ export class PremiereProTools {
         if (!qeSeq) return JSON.stringify({ success: false, error: "QE active sequence unavailable" });
 
         function buildIndices(count, requested) {
-          if (!requested || requested.length === 0) {
+          if (requested === null || typeof requested === "undefined") {
             var all = [];
             for (var idx = 0; idx < count; idx++) all.push(idx);
             return all;
@@ -4911,6 +5141,60 @@ export class PremiereProTools {
           paramName: ${JSON.stringify(paramName)},
           time: ${time},
           value: ${value}
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: e.toString() });
+      }
+    `;
+    return await this.bridge.executeScript(script);
+  }
+
+  private async batchAddKeyframes(keyframes: Array<{ clipId: string; componentName: string; paramName: string; time: number; value: number }>): Promise<any> {
+    const itemsJson = JSON.stringify(keyframes || []);
+    const script = `
+      try {
+        var items = ${itemsJson};
+        var results = [];
+        for (var idx = 0; idx < items.length; idx++) {
+          var item = items[idx];
+          try {
+            var info = __findClip(item.clipId);
+            if (!info) {
+              results.push({ clipId: item.clipId, time: item.time, value: item.value, success: false, error: "Clip not found" });
+              continue;
+            }
+            var clip = info.clip;
+            var param = null;
+            for (var i = 0; i < clip.components.numItems; i++) {
+              var comp = clip.components[i];
+              if (comp.displayName === item.componentName) {
+                for (var j = 0; j < comp.properties.numItems; j++) {
+                  if (comp.properties[j].displayName === item.paramName) {
+                    param = comp.properties[j];
+                    break;
+                  }
+                }
+                if (param) break;
+              }
+            }
+            if (!param) {
+              results.push({ clipId: item.clipId, time: item.time, value: item.value, success: false, error: "Parameter " + item.paramName + " not found in component " + item.componentName });
+              continue;
+            }
+            param.setTimeVarying(true);
+            var __kfTicks = __secondsToTicks(clip.inPoint.seconds + item.time);
+            param.addKey(__kfTicks);
+            param.setValueAtKey(__kfTicks, item.value, true);
+            results.push({ clipId: item.clipId, time: item.time, value: item.value, success: true });
+          } catch (eItem) {
+            results.push({ clipId: item.clipId, time: item.time, value: item.value, success: false, error: eItem.toString() });
+          }
+        }
+        return JSON.stringify({
+          success: true,
+          totalProcessed: results.length,
+          allOk: results.every ? results.every(function(r){ return r.success; }) : true,
+          results: results
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: e.toString() });
